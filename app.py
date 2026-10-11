@@ -10,6 +10,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 import auth
+from sources import REGISTRY
 
 ROOT = Path(__file__).resolve().parent
 DB = Path(os.environ.get('CASEPARSER_DB', ROOT / '.data' / 'cases.sqlite3'))
@@ -85,6 +86,15 @@ def init_db():
         CREATE TABLE IF NOT EXISTS login_failures(created_at REAL NOT NULL);
         ''')
         c.executemany('INSERT OR IGNORE INTO markets(name,url,note,cash) VALUES(?,?,?,?)', MARKETS)
+        for name,source in REGISTRY.items():
+            c.execute('INSERT OR IGNORE INTO collector_status(name,state,error) VALUES(?,?,?)',
+                      (name,'pending' if source['supported'] else 'not_connected',
+                       '' if source['supported'] else source.get('reason','Автосбор пока не реализован: требуется проверка документации и доступа к источнику.')))
+            if not source['supported']:
+                c.execute("UPDATE collector_status SET state='not_connected',error=? WHERE name=?",
+                          (source.get('reason','Автосбор пока не реализован: требуется проверка документации и доступа к источнику.'),name))
+            if source['supported']:
+                c.execute("UPDATE collector_status SET state='pending',error='',next_attempt=0 WHERE name=? AND state='not_connected'",(name,))
 
 
 def now():
@@ -194,6 +204,9 @@ def snapshot(count=1):
         history = [dict(r) for r in c.execute('SELECT q.*,m.name FROM quotes q JOIN markets m ON m.id=q.market_id ORDER BY observed_at,id')]
         auto_history = [dict(r) for r in c.execute('SELECT p.*,m.name FROM collected_prices p JOIN markets m ON m.id=p.market_id ORDER BY observed_at,id')]
         statuses = [dict(r) for r in c.execute('SELECT * FROM collector_status ORDER BY name')]
+        for status in statuses:
+            status['supported'] = REGISTRY.get(status['name'],{}).get('supported',False)
+            status['docs'] = REGISTRY.get(status['name'],{}).get('docs','')
         payments = [dict(r) for r in c.execute('SELECT p.*,b.owner FROM payments p JOIN batches b ON b.id=p.batch_id ORDER BY p.id DESC')]
     return dict(markets=markets, quotes=quotes, batches=batches, sales=sales, history=history, payments=payments,
                 automatic=automatic, auto_history=auto_history, collectors=statuses, payout_settings=list(settings.values()))

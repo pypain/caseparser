@@ -1,0 +1,20 @@
+"""Explicit coverage registry: missing integrations must never masquerade as prices."""
+REGISTRY = {
+    'Steam Community Market': {'supported': True, 'docs': 'https://steamcommunity.com/market/'},
+    'Market.CSGO': {'supported': True, 'docs': 'https://market.csgo.com/docs/'},
+    'Skinport': {'supported': True, 'docs': 'https://docs.skinport.com/'},
+    'CSFloat': {'supported': True, 'docs': 'https://docs.csfloat.com/', 'key': 'CSFLOAT_API_KEY'},
+    'DMarket': {'supported': False, 'docs': 'https://docs.dmarket.com/', 'reason': 'Публичный API закрыт (HTTP 410). Новый API требует авторизацию; формат цен пока не проверен.'},
+    'BitSkins': {'supported': False, 'docs': 'https://docs.bitskins.com/'},
+    'SkinBaron': {'supported': False, 'docs': 'https://skinbaron.de/'},
+    'GamerPay': {'supported': False, 'docs': 'https://gamerpay.gg/'},
+    'BUFF163': {'supported': False, 'docs': 'https://buff.163.com/'},
+    'BUFF Market': {'supported': False, 'docs': 'https://buff.market/'},
+    'YouPin': {'supported': False, 'docs': 'https://www.youpin898.com/'},
+    'C5Game': {'supported': False, 'docs': 'https://www.c5game.com/'},
+    'LIS-SKINS': {'supported': False, 'docs': 'https://lis-skins.com/', 'reason': 'Публичная полная выгрузка превышает 1 ГБ. Нужен проверенный API для выборки одного товара.'},
+    'Waxpeer': {'supported': True, 'docs': 'https://waxpeer.com/'},
+    'ShadowPay': {'supported': False, 'docs': 'https://shadowpay.com/'},
+    'white.market': {'supported': False, 'docs': 'https://white.market/'},
+    'Tradeit': {'supported': True, 'docs': 'https://tradeit.gg/'},
+}

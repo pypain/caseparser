@@ -3,6 +3,7 @@ import argparse
 import gzip
 import io
 import json
+import os
 import re
 import threading
 import time
@@ -12,6 +13,7 @@ from urllib.parse import urlparse
 from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal
 import app
+from sources import REGISTRY
 
 ITEM = 'Danger Zone Case'
 URL = 'https://market.csgo.com/api/v2/prices/RUB.json'
@@ -19,6 +21,9 @@ SOURCES = {
     'Market.CSGO': URL,
     'Steam Community Market': 'https://steamcommunity.com/market/priceoverview/?appid=730&currency=5&market_hash_name=Danger%20Zone%20Case',
     'Skinport': 'https://api.skinport.com/v1/items?app_id=730&currency=USD&tradable=0',
+    'CSFloat': 'https://csfloat.com/api/v1/listings?limit=50&market_hash_name=Danger%20Zone%20Case&sort_by=lowest_price',
+    'Tradeit': 'https://tradeit.gg/api/v2/inventory/data?gameId=730&searchValue=Danger%20Zone%20Case&limit=100&offset=0&isForStore=1',
+    'Waxpeer': 'https://api.waxpeer.com/v1/prices?game=csgo&search=Danger%20Zone%20Case&minified=1',
 }
 INTERVAL = 900
 MAX_BYTES = 32 * 1024 * 1024
@@ -61,6 +66,46 @@ def parse_skinport(data):
     return positive_price(matches[0].get('min_price'))
 
 
+def minor_units(value):
+    amount = Decimal(str(value))
+    if not amount.is_finite() or amount <= 0 or amount != amount.to_integral_value():
+        raise ValueError('Источник вернул некорректную цену в центах')
+    return amount / 100
+
+
+def parse_csfloat(data):
+    rows = data.get('data') if isinstance(data, dict) else data
+    if not isinstance(rows, list):
+        raise ValueError('Неизвестный формат API CSFloat')
+    prices = [minor_units(row['price']) for row in rows
+              if row.get('item', {}).get('market_hash_name') == ITEM and row.get('type') == 'buy_now']
+    if not prices:
+        raise ValueError('CSFloat: предложений Danger Zone Case не найдено')
+    return positive_price(min(prices))
+
+
+def parse_waxpeer(data):
+    # Waxpeer /v1/prices uses thousandths of USD, not cents.
+    # Response and units also documented in waxpeer npm wrapper 1.6.3.
+    if not isinstance(data,dict) or data.get('success') is not True or not isinstance(data.get('items'),list):
+        raise ValueError('Неизвестный формат API Waxpeer')
+    prices = [minor_units(row['min']) / 10 for row in data['items'] if row.get('name') == ITEM]
+    if not prices:
+        raise ValueError('Waxpeer: предложений Danger Zone Case не найдено')
+    return positive_price(min(prices))
+
+
+def parse_tradeit(data):
+    if not isinstance(data, dict) or not isinstance(data.get('items'), list):
+        raise ValueError('Неизвестный формат API Tradeit')
+    # Store USD prices are cents; trading balance is a different price.
+    prices = [minor_units(row['storePrice']) for row in data['items']
+              if row.get('name') == ITEM and row.get('storePrice') is not None]
+    if not prices:
+        raise ValueError('Tradeit: предложений Danger Zone Case не найдено (ключ от кейса не учитывается)')
+    return positive_price(min(prices))
+
+
 class SameHostRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         if urlparse(newurl).scheme != 'https' or urlparse(newurl).hostname != urlparse(req.full_url).hostname:
@@ -68,8 +113,8 @@ class SameHostRedirect(urllib.request.HTTPRedirectHandler):
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
-def fetch_json(url):
-    req = urllib.request.Request(url, headers={'User-Agent':'Caseparser/0.2', 'Accept':'application/json', 'Accept-Encoding':'gzip'})
+def fetch_json(url, headers=None):
+    req = urllib.request.Request(url, headers={'User-Agent':'Caseparser/0.3', 'Accept':'application/json', 'Accept-Encoding':'gzip'} | (headers or {}))
     with urllib.request.build_opener(SameHostRedirect()).open(req, timeout=12) as r:
         raw = r.read(MAX_BYTES + 1)
         if len(raw) > MAX_BYTES:
@@ -83,12 +128,16 @@ def fetch_json(url):
 
 
 def fetch_price(name):
-    data = fetch_json(SOURCES[name])
+    headers = {}
+    if name == 'CSFloat' and os.environ.get('CSFLOAT_API_KEY'):
+        headers['Authorization'] = os.environ['CSFLOAT_API_KEY']
+    data = fetch_json(SOURCES[name],headers)
     if name == 'Market.CSGO':
         return parse_price(data), 'RUB'
     if name == 'Steam Community Market':
         return parse_steam(data), 'RUB'
-    return parse_skinport(data), 'USD'
+    parsers = {'Skinport':parse_skinport, 'CSFloat':parse_csfloat, 'Waxpeer':parse_waxpeer, 'Tradeit':parse_tradeit}
+    return parsers[name](data), 'USD'
 
 
 def error_message(exc):
@@ -124,9 +173,13 @@ def collect_source(name, fetcher=fetch_price, clock=time.time):
                       ('ok','',app.now(),clock() + INTERVAL,name))
     except Exception as exc:
         failures = old['failures'] + 1
+        state = 'needs_key' if isinstance(exc, urllib.error.HTTPError) and exc.code == 401 else 'error'
+        message = error_message(exc)
+        if state == 'needs_key':
+            message = 'API требует авторизацию. Настрой ключ источника на сервере; не передавай ключ в чат.'
         with app.connect() as c:
             c.execute('UPDATE collector_status SET state=?,error=?,failures=?,next_attempt=? WHERE name=?',
-                      ('error', error_message(exc), failures, clock() + min(21600, INTERVAL * 2 ** min(failures-1,5)), name))
+                      (state, message, failures, clock() + min(21600, INTERVAL * 2 ** min(failures-1,5)), name))
     return True
 
 
@@ -164,7 +217,7 @@ class Collector:
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Сбор Danger Zone Case: Market.CSGO, Steam, Skinport')
+    parser = argparse.ArgumentParser(description='Автосбор Danger Zone Case со всех подключенных источников')
     parser.add_argument('--once', action='store_true', help='Один цикл вместо постоянного обновления')
     args = parser.parse_args()
     app.init_db()
@@ -174,7 +227,7 @@ def main():
         with app.connect() as c:
             rows = [dict(r) for r in c.execute('SELECT * FROM collector_status')]
         print(json.dumps(rows, ensure_ascii=False, indent=2))
-        return 1 if any(r['state'] == 'error' for r in rows) else 0
+        return 1 if any(r['state'] in ('error','needs_key') for r in rows) else 0
     worker.start()
     try:
         while True:

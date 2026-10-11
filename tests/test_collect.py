@@ -53,7 +53,7 @@ class CollectorTests(unittest.TestCase):
         collect.collect_source('Market.CSGO',self.fail,lambda:2800)
         state=app.snapshot()
         self.assertEqual(len(state['auto_history']),1)
-        status=state['collectors'][0]
+        status=next(s for s in state['collectors'] if s['name']=='Market.CSGO')
         self.assertEqual(status['failures'],2)
         self.assertEqual(status['next_attempt'],4600)
         self.assertIn('Прокси',status['error'])
@@ -96,6 +96,36 @@ class CollectorTests(unittest.TestCase):
         req=urllib.request.Request(collect.URL)
         with self.assertRaises(ValueError):
             collect.SameHostRedirect().redirect_request(req,None,302,'',{},'https://example.com/')
+
+    def test_all_markets_have_explicit_coverage(self):
+        state=app.snapshot()
+        self.assertEqual({m['name'] for m in state['markets']},{s['name'] for s in state['collectors']})
+        self.assertEqual({n for n,s in collect.REGISTRY.items() if s['supported']},set(collect.SOURCES))
+        self.assertFalse(next(s for s in state['collectors'] if s['name']=='BUFF163')['supported'])
+
+    def test_new_price_units_and_exact_item(self):
+        self.assertEqual(collect.parse_csfloat({'data':[
+            {'price':1,'type':'buy_now','item':{'market_hash_name':'Other'}},
+            {'price':88,'type':'buy_now','item':{'market_hash_name':collect.ITEM}},
+            {'price':10,'type':'auction','item':{'market_hash_name':collect.ITEM}}]}),'0.88')
+        self.assertEqual(collect.parse_waxpeer({'success':True,'items':[
+            {'name':collect.ITEM,'min':1234},{'name':'Other','min':1}]}),'1.234')
+        for parser,data in [(collect.parse_csfloat,{'data':[]}),
+                            (collect.parse_waxpeer,{'success':False,'items':[]})]:
+            with self.assertRaises(ValueError):parser(data)
+
+    def test_tradeit_uses_store_price_not_trading_balance_or_case_key(self):
+        self.assertEqual(collect.parse_tradeit({'items':[
+            {'name':collect.ITEM+' Key','storePrice':1},
+            {'name':collect.ITEM,'priceForTrade':999,'storePrice':123}]}),'1.23')
+        with self.assertRaises(ValueError):
+            collect.parse_tradeit({'items':[{'name':collect.ITEM+' Key','storePrice':123}]})
+
+    def test_http401_distinct_from_network_error(self):
+        def denied(name):raise urllib.error.HTTPError(collect.SOURCES[name],401,'Unauthorized',{},None)
+        collect.collect_source('CSFloat',denied,lambda:1000)
+        status=next(s for s in app.snapshot()['collectors'] if s['name']=='CSFloat')
+        self.assertEqual(status['state'],'needs_key')
 
 
 if __name__ == '__main__':

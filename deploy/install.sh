@@ -41,7 +41,7 @@ useradd --system --user-group --home-dir /var/lib/caseparser --shell /usr/sbin/n
 install -d -m 755 /opt/caseparser /opt/caseparser/app
 install -d -m 750 -o root -g caseparser /etc/caseparser
 install -d -m 700 -o caseparser -g caseparser /var/lib/caseparser
-tar -cf - app.py auth.py collect.py static README.md | tar -xf - -C /opt/caseparser/app
+tar -cf - app.py auth.py collect.py sources.py static README.md | tar -xf - -C /opt/caseparser/app
 chown -R root:root /opt/caseparser
 find /opt/caseparser -type d -exec chmod 755 {} +
 find /opt/caseparser -type f -exec chmod 644 {} +
