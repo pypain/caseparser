@@ -1,4 +1,4 @@
-"""Local case inventory and marketplace comparison. Python 3.12, no dependencies."""
+"""Local case inventory and marketplace comparison. Python 3.9, no dependencies."""
 import csv
 import io
 import json

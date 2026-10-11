@@ -12,7 +12,10 @@ TASK_IP=${CASEPARSER_DEPLOY_IP:-107.161.175.52}
 for task_command in python3 openssl systemctl ss useradd install tar curl; do
   command -v "$task_command" >/dev/null || { echo "Не найдена команда: $task_command. Установка не начата."; exit 1; }
 done
-python3 -c 'import sys; assert sys.version_info >= (3,12), "Нужен Python 3.12+"'
+if ! python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3,9) else 1)'; then
+  echo "Нужен Python 3.9+. Установлен: $(python3 --version 2>&1). Установка не начата."
+  exit 1
+fi
 [[ $(systemctl is-system-running 2>/dev/null || true) != offline ]] || { echo 'Нужен работающий systemd'; exit 1; }
 for task_path in /opt/caseparser /etc/caseparser /var/lib/caseparser /etc/systemd/system/caseparser.service; do
   [[ ! -e $task_path ]] || { echo "Уже существует $task_path. Остановлено без перезаписи."; exit 1; }

@@ -1,11 +1,11 @@
 # Caseparser — Danger Zone Case
 
 Локальное приложение для сравнения цен CS2 Danger Zone Case и учета чужих кейсов.
-Python 3.12+, SQLite, без сторонних зависимостей.
+Python 3.9+, SQLite, без сторонних зависимостей.
 
 ## Запуск на своем компьютере
 
-Установи Python 3.12 или новее и Git. Затем в терминале:
+Установи Python 3.9 или новее и Git. Затем в терминале:
 
 ```sh
 git clone https://github.com/pypain/caseparser.git
@@ -49,7 +49,7 @@ CASEPARSER_PASSWORD_HASH="$(cat .data/password.hash)" python3 app.py
 
 ## Отдельное размещение на сервере
 
-Подготовлен `deploy/install.sh` для **первой** установки на Linux с systemd и Python 3.12+.
+Подготовлен `deploy/install.sh` для **первой** установки на Linux с systemd и Python 3.9+.
 Сервер должен иметь openssl, curl и стандартные административные утилиты.
 Сначала выполни на сервере:
 
