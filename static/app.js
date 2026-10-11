@@ -1,4 +1,21 @@
 let state;
+const routes={
+  '/prices':['compare','Сравнение цен','Сравнивай площадки по сумме, которую получишь после вывода.'],
+  '/collection':['automatic','Автоматический сбор','Свежие котировки, состояние источников и настройки вывода.'],
+  '/inventory':['inventory','Кейсы и выплаты','Партии, завершенные продажи и расчеты с владельцами.'],
+  '/history':['history','История цен','Следи за изменением цены Danger Zone на разных площадках.'],
+  '/markets':['markets','Площадки','Управляй площадками и исключай нежелательные места продажи.']
+};
+function navigate(path, push=false){
+  if(!routes[path])path='/prices';if(push)history.pushState({},'',path);
+  const [id,title,description]=routes[path];document.querySelectorAll('.page-panel').forEach(s=>s.hidden=s.id!==id);
+  document.querySelectorAll('[data-route]').forEach(a=>{const active=a.getAttribute('href')===path;a.classList.toggle('active',active);if(active)a.setAttribute('aria-current','page');else a.removeAttribute('aria-current');});
+  document.querySelector('#page-title').textContent=title;document.querySelector('#page-name').textContent=title;document.querySelector('#page-description').textContent=description;document.title=title+' · Caseparser';window.scrollTo(0,0);
+}
+document.addEventListener('click',e=>{const a=e.target.closest('a[data-route]');if(a&&!e.ctrlKey&&!e.metaKey&&!e.shiftKey&&e.button===0){e.preventDefault();navigate(a.getAttribute('href'),true);}});
+window.addEventListener('popstate',()=>navigate(location.pathname));
+navigate(location.pathname);
+document.documentElement.dataset.theme=localStorage.getItem('theme')||'light';
 const $ = s => document.querySelector(s);
 const rub = n => new Intl.NumberFormat('ru-RU', {style:'currency',currency:'RUB'}).format(n / 100);
 const date = s => new Date(s).toLocaleString('ru-RU', {timeZone:'Europe/Moscow'}) + ' МСК';
@@ -8,6 +25,7 @@ const cash = (n,c) => new Intl.NumberFormat('ru-RU',{style:'currency',currency:c
 function options(s, html){const value=s.value;s.innerHTML=html;if([...s.options].some(o=>o.value===value))s.value=value;}
 async function api(path, data) {
   const r = await fetch('/api/' + path, data === undefined ? {} : {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});
+  if(r.status===401){location.assign('/login');throw new Error('Требуется вход');}
   const body = await r.json(); if(!r.ok) throw new Error(body.error); return body;
 }
 function report(e){$('#error').textContent = e.message;}
@@ -17,12 +35,15 @@ async function load(){
 }
 function render(){
   const {markets,quotes,batches,sales,payments} = state;
+  $('#price-count').textContent=state.automatic.length;
+  $('#stock-count').textContent=batches.reduce((a,b)=>a+b.remaining,0);
   $('#auto-prices').innerHTML = state.automatic.map(p=>`<tr><td>${esc(p.name)}${p.stale?'<small>Цена устарела</small>':''}</td><td>${cash(p.price,p.currency)}</td><td>${date(p.observed_at)}</td><td>${esc(p.source)}</td></tr>`).join('') || '<tr><td colspan="4">Сбор еще не получил цены. Проверь статус источников.</td></tr>';
   $('#collector-status').innerHTML = state.collectors.map(s=>`<div class="card"><strong>${esc(s.name)}</strong><p>${({pending:'Ожидание',running:'Запрос выполняется',ok:'Цена получена',error:'Ошибка сбора'})[s.state]}</p><p>${esc(s.error)}</p><p>Последний успех: ${s.last_success?date(s.last_success):'не было'}<br>Следующая попытка: ${s.next_attempt?date(new Date(s.next_attempt*1000).toISOString()):'при запуске'}</p></div>`).join('');
   document.querySelectorAll('.auto-market-options').forEach(s=>options(s,markets.filter(m=>['Market.CSGO','Skinport','Steam Community Market'].includes(m.name)).map(m=>option(m.id,m.name)).join('')));
   $('#saved-settings').innerHTML = state.payout_settings.map(s=>`<p>${esc(markets.find(m=>m.id===s.market_id).name)} · ${esc(s.method)} · продажа ${esc(s.sale_fee)}% · вывод ${esc(s.withdrawal_fee)}% + ${rub(s.fixed_fee)} · курс ${esc(s.rub_rate)} · ${s.verified?'Подтверждено вручную':'Не подтверждено'}</p>`).join('');
   const kinds = {instant:'Мгновенная продажа', listing:'Цена выставления'};
-  $('#quotes').innerHTML = quotes.length ? quotes.map(q => `<tr><td>${esc(q.name)}<small>${kinds[q.kind]}</small></td><td>${rub(q.price)}<small>Продажа ${esc(q.sale_fee)}%; вывод ${esc(q.withdrawal_fee)}% + ${rub(q.fixed_fee)}</small></td><td>${esc(q.method)}</td><td>${rub(q.received)}</td><td>${rub(q.own_share)}</td><td>${rub(q.owner_share)}</td><td>${date(q.observed_at)}<small>${esc(q.source)}</small></td><td>${!q.cash?'Баланс Steam':q.excluded?'Исключена':!q.verified?'Вывод не проверен':q.stale?'Цена устарела':'Проверено вручную'}</td></tr>`).join('') : '<tr><td colspan="8">Пока нет цен. Добавь проверенную котировку или загрузи CSV.</td></tr>';
+  const displayed=[...quotes,...state.automatic.filter(p=>!quotes.some(q=>q.automatic&&q.market_id===p.market_id)).map(p=>({...p,kind:'listing',unknownFees:true}))];
+  $('#quotes').innerHTML = displayed.length ? displayed.map(q => `<tr><td>${esc(q.name)}<small>${kinds[q.kind]}</small></td><td>${q.unknownFees?cash(q.price,q.currency):rub(q.price)}<small>${q.unknownFees?'Условия вывода не заданы':`Продажа ${esc(q.sale_fee)}%; вывод ${esc(q.withdrawal_fee)}% + ${rub(q.fixed_fee)}`}</small></td><td>${q.unknownFees?'Настрой в разделе «Автосбор»':esc(q.method)}</td><td>${q.unknownFees?'—':rub(q.received)}</td><td>${q.unknownFees?'—':rub(q.own_share)}</td><td>${q.unknownFees?'—':rub(q.owner_share)}</td><td>${date(q.observed_at)}<small>${esc(q.source)}</small></td><td>${!q.cash?'Баланс Steam':q.excluded?'Исключена':q.unknownFees?'Нужны комиссии':!q.verified?'Вывод не проверен':q.stale?'Цена устарела':'Проверено вручную'}</td></tr>`).join('') : '<tr><td colspan="8">Пока нет цен. Проверь раздел «Автосбор» или добавь котировку вручную.</td></tr>';
   const instant = quotes.find(q => q.eligible && q.kind === 'instant');
   const listing = quotes.find(q => q.eligible && q.kind === 'listing');
   $('#best').textContent = instant ? `Лучшая актуальная заявка по введенным данным: ${instant.name}, ${rub(instant.received)} после вывода за ${$('#count').value} кейсов. Объем спроса не проверен.` : 'Для рекомендации нужны актуальная цена мгновенной продажи и проверенный способ вывода.';
@@ -64,3 +85,5 @@ $('#count').addEventListener('change',()=>load().catch(report));$('#history-mark
 $('#history-currency').addEventListener('change',chart);
 $('#collect-now').addEventListener('click',async()=>{const b=$('#collect-now');b.disabled=true;try{await api('collect',{});$('#collect-message').textContent='Обновление запрошено. До следующей разрешенной попытки повторные запросы к API не отправляются.';await load();}catch(e){report(e);}finally{b.disabled=false;}});
 setInterval(()=>{if(document.visibilityState==='visible')load().catch(report);},15000);
+$('#logout').addEventListener('click',async()=>{try{await api('logout',{});location.assign('/login');}catch(e){report(e);}});
+$('#theme-toggle').addEventListener('click',()=>{const theme=document.documentElement.dataset.theme==='dark'?'light':'dark';document.documentElement.dataset.theme=theme;localStorage.setItem('theme',theme);});

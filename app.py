@@ -9,10 +9,14 @@ from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
+import auth
 
 ROOT = Path(__file__).resolve().parent
 DB = Path(os.environ.get('CASEPARSER_DB', ROOT / '.data' / 'cases.sqlite3'))
 COLLECTOR = None
+PASSWORD_HASH = os.environ.get('CASEPARSER_PASSWORD_HASH', '')
+COOKIE_SECURE = os.environ.get('CASEPARSER_COOKIE_SECURE', '0') == '1'
+PAGES = ('/', '/prices', '/collection', '/inventory', '/history', '/markets')
 MARKETS = [
     ('Steam Community Market', 'https://steamcommunity.com/market/', 'Баланс Steam; прямого вывода нет', 0),
     ('CSFloat', 'https://csfloat.com/', 'Условия и доступность в РФ требуют проверки', 1),
@@ -77,6 +81,8 @@ def init_db():
           market_id INTEGER PRIMARY KEY REFERENCES markets(id), sale_fee TEXT NOT NULL,
           withdrawal_fee TEXT NOT NULL, fixed_fee INTEGER NOT NULL, method TEXT NOT NULL,
           verified INTEGER NOT NULL, rub_rate TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS sessions(digest TEXT PRIMARY KEY,expires REAL NOT NULL);
+        CREATE TABLE IF NOT EXISTS login_failures(created_at REAL NOT NULL);
         ''')
         c.executemany('INSERT OR IGNORE INTO markets(name,url,note,cash) VALUES(?,?,?,?)', MARKETS)
 
@@ -258,26 +264,49 @@ def mutate(path, d):
 
 
 class Handler(BaseHTTPRequestHandler):
-    def send(self, status, body, content_type='application/json; charset=utf-8'):
+    def send(self, status, body, content_type='application/json; charset=utf-8', headers=None):
         self.send_response(status)
         self.send_header('Content-Type', content_type)
         self.send_header('Content-Length', str(len(body)))
         self.send_header('Cache-Control', 'no-store')
+        self.send_header('Referrer-Policy', 'same-origin')
+        for key,value in (headers or {}).items():
+            self.send_header(key, value)
         self.send_header('X-Content-Type-Options', 'nosniff')
         self.send_header('Content-Security-Policy', "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'")
         self.end_headers()
         self.wfile.write(body)
 
+    def authenticated(self):
+        if not PASSWORD_HASH:
+            return True
+        with connect() as c:
+            return auth.authorized(c, self.headers.get('Cookie'))
+
+    def session_cookie(self, token, age=auth.SESSION_AGE):
+        return f'caseparser_session={token}; Path=/; Max-Age={age}; HttpOnly; SameSite=Strict' + ('; Secure' if COOKIE_SECURE else '')
+
     def do_GET(self):
         from urllib.parse import parse_qs
         u = urlparse(self.path)
         try:
+            if u.path in ('/login', '/login.js', '/style.css'):
+                name = {'/login':'login.html','/login.js':'login.js','/style.css':'style.css'}[u.path]
+                mime = {'/login':'text/html','/login.js':'text/javascript','/style.css':'text/css'}[u.path]
+                self.send(200,(ROOT/'static'/name).read_bytes(),mime+'; charset=utf-8')
+                return
+            if not self.authenticated():
+                if u.path.startswith('/api/'):
+                    self.send(401,b'{"error":"Authentication required"}')
+                else:
+                    self.send(303,b'',headers={'Location':'/login'})
+                return
             if u.path == '/api/state':
                 count = quantity(parse_qs(u.query).get('quantity', ['1'])[0])
                 self.send(200, json.dumps(snapshot(count), ensure_ascii=False).encode())
-            elif u.path in ('/', '/app.js', '/style.css'):
-                file = ROOT / 'static' / {'/': 'index.html', '/app.js': 'app.js', '/style.css': 'style.css'}[u.path]
-                mime = {'/': 'text/html', '/app.js': 'text/javascript', '/style.css': 'text/css'}[u.path]
+            elif u.path in PAGES or u.path == '/app.js':
+                file = ROOT / 'static' / ('app.js' if u.path == '/app.js' else 'index.html')
+                mime = 'text/javascript' if u.path == '/app.js' else 'text/html'
                 self.send(200, file.read_bytes(), mime + '; charset=utf-8')
             else:
                 self.send(404, b'{"error":"Not found"}')
@@ -285,7 +314,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send(400, json.dumps({'error': str(exc)}, ensure_ascii=False).encode())
 
     def do_POST(self):
-        # Local-only application: require JSON and same-origin browser requests.
+        # Require JSON and same-origin browser requests, including login.
         origin = self.headers.get('Origin')
         if origin and urlparse(origin).netloc != self.headers.get('Host'):
             self.send(403, b'{"error":"Origin rejected"}')
@@ -297,6 +326,28 @@ class Handler(BaseHTTPRequestHandler):
             d = json.loads(self.rfile.read(length))
             if not isinstance(d, dict):
                 raise ValueError('Ожидается JSON-объект')
+            path = urlparse(self.path).path
+            if path == '/api/login':
+                if not PASSWORD_HASH:
+                    self.send(200,b'{"ok":true}')
+                    return
+                with connect() as c:
+                    token,status = auth.login(c,d.get('password'),PASSWORD_HASH)
+                if token:
+                    self.send(200,b'{"ok":true}',headers={'Set-Cookie':self.session_cookie(token)})
+                else:
+                    message = 'Слишком много попыток. Повтори через 15 минут.' if status==429 else 'Неверный пароль'
+                    self.send(status,json.dumps({'error':message},ensure_ascii=False).encode())
+                return
+            if not self.authenticated():
+                self.send(401,b'{"error":"Authentication required"}')
+                return
+            if path == '/api/logout':
+                with connect() as c:
+                    token = auth.token_from_cookie(self.headers.get('Cookie'))
+                    c.execute('DELETE FROM sessions WHERE digest=?',(auth.token_digest(token),))
+                self.send(200,b'{"ok":true}',headers={'Set-Cookie':self.session_cookie('',0)})
+                return
             if urlparse(self.path).path == '/api/collect':
                 if COLLECTOR is None:
                     raise ValueError('Сборщик не запущен')
@@ -315,8 +366,20 @@ if __name__ == '__main__':
     from collect import Collector
     init_db()
     port = int(os.environ.get('PORT', '8000'))
-    print(f'Caseparser: http://127.0.0.1:{port}', flush=True)
-    server = ThreadingHTTPServer(('127.0.0.1', port), Handler)
+    host = os.environ.get('CASEPARSER_HOST','127.0.0.1')
+    cert,key = os.environ.get('CASEPARSER_TLS_CERT'),os.environ.get('CASEPARSER_TLS_KEY')
+    if bool(cert) != bool(key):
+        raise SystemExit('Both TLS certificate and key are required')
+    if host not in ('127.0.0.1','localhost','::1') and (not PASSWORD_HASH or not cert or not COOKIE_SECURE):
+        raise SystemExit('Public binding requires a password hash, TLS and secure cookies')
+    server = ThreadingHTTPServer((host, port), Handler)
+    if cert:
+        import ssl
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.minimum_version = ssl.TLSVersion.TLSv1_2
+        context.load_cert_chain(cert,key)
+        server.socket = context.wrap_socket(server.socket,server_side=True)
+    print(f"Caseparser: {'https' if cert else 'http'}://{host}:{port}", flush=True)
     COLLECTOR = Collector()
     COLLECTOR.start()
     try:
