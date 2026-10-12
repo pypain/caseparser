@@ -101,7 +101,8 @@ class CollectorTests(unittest.TestCase):
         state=app.snapshot()
         self.assertEqual({m['name'] for m in state['markets']},{s['name'] for s in state['collectors']})
         self.assertEqual({n for n,s in collect.REGISTRY.items() if s['supported']},set(collect.SOURCES))
-        self.assertFalse(next(s for s in state['collectors'] if s['name']=='BUFF163')['supported'])
+        self.assertTrue(next(s for s in state['collectors'] if s['name']=='BUFF163')['supported'])
+        self.assertFalse(next(s for s in state['collectors'] if s['name']=='BitSkins')['supported'])
 
     def test_new_price_units_and_exact_item(self):
         self.assertEqual(collect.parse_csfloat({'data':[
@@ -126,6 +127,56 @@ class CollectorTests(unittest.TestCase):
         collect.collect_source('CSFloat',denied,lambda:1000)
         status=next(s for s in app.snapshot()['collectors'] if s['name']=='CSFloat')
         self.assertEqual(status['state'],'needs_key')
+
+    def test_fallback_sale_estimate_has_source_and_never_becomes_recommendation(self):
+        quote=collect.PriceQuote('0.87','USD',collect.COMPARISON_URL+'#tab-Sell','estimate','Public comparison')
+        collect.collect_source('white.market',lambda name:quote,lambda:1000)
+        market=next(m for m in app.snapshot()['markets'] if m['name']=='white.market')
+        app.mutate('/api/payout-settings',dict(market_id=market['id'],sale_fee='5',withdrawal_fee='2',
+            fixed_fee_rub='0',method='Крипто',rub_rate='100',verified=1))
+        state=app.snapshot()
+        self.assertEqual(state['automatic'][0]['kind'],'estimate')
+        self.assertEqual(state['auto_history'][0]['source'],quote.source)
+        self.assertEqual(state['quotes'][0]['kind'],'estimate')
+        self.assertEqual(state['quotes'][0]['price'],8700)
+        self.assertFalse(state['quotes'][0]['eligible'])
+        self.assertIn('CSGOSKINS.GG',state['quotes'][0]['source_label'])
+
+    def test_eur_conversion_and_raw_history(self):
+        collect.collect_source('SkinBaron',lambda name:('0.88','EUR'),lambda:1000)
+        app.mutate('/api/payout-settings',dict(market_id=6,sale_fee='0',withdrawal_fee='0',
+            fixed_fee_rub='0',method='Крипто',rub_rate='110',verified=1))
+        state=app.snapshot()
+        self.assertEqual(state['quotes'][0]['price'],9680)
+        self.assertEqual((state['auto_history'][0]['price'],state['auto_history'][0]['currency']),(88,'EUR'))
+        # A fallback can quote USD while the direct page uses EUR; never reuse EUR FX.
+        collect.collect_source('SkinBaron',lambda name:('0.98','USD'),lambda:1900)
+        state=app.snapshot()
+        self.assertTrue(state['automatic'][0]['rate_mismatch'])
+        self.assertEqual(state['quotes'],[])
+        app.mutate('/api/payout-settings',dict(market_id=6,sale_fee='0',withdrawal_fee='0',
+            fixed_fee_rub='0',method='Крипто',rub_rate='100',rate_currency='USD',verified=1))
+        self.assertEqual(app.snapshot()['quotes'][0]['price'],9800)
+
+    def test_existing_database_migration_preserves_prices_inventory_and_cooldown(self):
+        app.mutate('/api/batches',{'owner':'Владелец','quantity':100})
+        collect.collect_source('Market.CSGO',self.fetch,lambda:1000)
+        with app.connect() as c:
+            c.execute('ALTER TABLE collected_prices RENAME TO prices_before_upgrade')
+            c.execute('''CREATE TABLE collected_prices(id INTEGER PRIMARY KEY, market_id INTEGER,
+                price INTEGER NOT NULL, currency TEXT NOT NULL, observed_at TEXT NOT NULL, source TEXT NOT NULL)''')
+            c.execute('''INSERT INTO collected_prices SELECT id,market_id,price,currency,observed_at,source
+                FROM prices_before_upgrade''')
+            c.execute('DROP TABLE prices_before_upgrade')
+        app.init_db()
+        state=app.snapshot()
+        self.assertEqual(state['automatic'][0]['price'],10025)
+        self.assertEqual(state['automatic'][0]['kind'],'listing')
+        self.assertEqual(state['batches'][0]['remaining'],100)
+        self.assertEqual(next(s for s in state['collectors'] if s['name']=='Market.CSGO')['next_attempt'],0)
+        collect.collect_source('Market.CSGO',self.fetch,lambda:1001)
+        app.init_db()
+        self.assertFalse(collect.collect_source('Market.CSGO',self.fail,lambda:1002))
 
 
 if __name__ == '__main__':

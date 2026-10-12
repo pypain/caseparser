@@ -13,7 +13,7 @@ TASK_STAGE="/opt/caseparser/staging-$TASK_STAMP"
 TASK_BACKUP="/opt/caseparser/backup-$TASK_STAMP"
 [[ ! -e $TASK_STAGE && ! -e $TASK_BACKUP ]] || { echo 'Каталог обновления уже существует'; exit 1; }
 install -d -m 755 "$TASK_STAGE"
-tar -cf - app.py auth.py collect.py sources.py static README.md | tar -xf - -C "$TASK_STAGE"
+tar -cf - app.py auth.py collect.py sources.py public_pages.py static README.md | tar -xf - -C "$TASK_STAGE"
 find "$TASK_STAGE" -type d -exec chmod 755 {} +
 find "$TASK_STAGE" -type f -exec chmod 644 {} +
 TASK_PORT=$(sed -n 's/^PORT=//p' /etc/caseparser/environment)

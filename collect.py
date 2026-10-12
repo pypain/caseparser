@@ -12,19 +12,26 @@ import urllib.request
 from urllib.parse import urlparse
 from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal
+from dataclasses import dataclass
+from public_pages import COMPARISON_URL, COMPARISON_MARKETS, parse_comparison
 import app
 from sources import REGISTRY
 
 ITEM = 'Danger Zone Case'
 URL = 'https://market.csgo.com/api/v2/prices/RUB.json'
-SOURCES = {
+DIRECT_SOURCES = {
     'Market.CSGO': URL,
     'Steam Community Market': 'https://steamcommunity.com/market/priceoverview/?appid=730&currency=5&market_hash_name=Danger%20Zone%20Case',
     'Skinport': 'https://api.skinport.com/v1/items?app_id=730&currency=USD&tradable=0',
     'CSFloat': 'https://csfloat.com/api/v1/listings?limit=50&market_hash_name=Danger%20Zone%20Case&sort_by=lowest_price',
     'Tradeit': 'https://tradeit.gg/api/v2/inventory/data?gameId=730&searchValue=Danger%20Zone%20Case&limit=100&offset=0&isForStore=1',
+    'LIS-SKINS': 'https://lis-skins.com/market/csgo/danger-zone-case/',
+    'SkinBaron': 'https://skinbaron.de/en/csgo/Container/Danger-Zone-Case?sort=PA',
     'Waxpeer': 'https://api.waxpeer.com/v1/prices?game=csgo&search=Danger%20Zone%20Case&minified=1',
 }
+SOURCES = dict(DIRECT_SOURCES)
+for name in COMPARISON_MARKETS.values():
+    SOURCES.setdefault(name, COMPARISON_URL)
 INTERVAL = 900
 MAX_BYTES = 32 * 1024 * 1024
 
@@ -113,7 +120,7 @@ class SameHostRedirect(urllib.request.HTTPRedirectHandler):
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
-def fetch_json(url, headers=None):
+def fetch_text(url, headers=None):
     req = urllib.request.Request(url, headers={'User-Agent':'Caseparser/0.3', 'Accept':'application/json', 'Accept-Encoding':'gzip'} | (headers or {}))
     with urllib.request.build_opener(SameHostRedirect()).open(req, timeout=12) as r:
         raw = r.read(MAX_BYTES + 1)
@@ -124,14 +131,22 @@ def fetch_json(url, headers=None):
                 raw = gz.read(MAX_BYTES + 1)
             if len(raw) > MAX_BYTES:
                 raise ValueError('Распакованный ответ API слишком большой')
-        return json.loads(raw)
+        return raw.decode('utf-8')
 
 
-def fetch_price(name):
+def fetch_json(url, headers=None):
+    return json.loads(fetch_text(url, headers))
+
+
+def fetch_direct_price(name):
     headers = {}
     if name == 'CSFloat' and os.environ.get('CSFLOAT_API_KEY'):
         headers['Authorization'] = os.environ['CSFLOAT_API_KEY']
-    data = fetch_json(SOURCES[name],headers)
+    if name in ('LIS-SKINS', 'SkinBaron'):
+        from public_pages import parse_lis, parse_skinbaron
+        html = fetch_text(DIRECT_SOURCES[name], {'Accept': 'text/html'})
+        return (parse_lis(html), 'USD') if name == 'LIS-SKINS' else (parse_skinbaron(html), 'EUR')
+    data = fetch_json(DIRECT_SOURCES[name],headers)
     if name == 'Market.CSGO':
         return parse_price(data), 'RUB'
     if name == 'Steam Community Market':
@@ -150,6 +165,56 @@ def error_message(exc):
     return str(exc)[:300]
 
 
+@dataclass(frozen=True)
+class PriceQuote:
+    price: str
+    currency: str
+    source: str
+    kind: str = 'listing'
+    note: str = ''
+
+
+class CycleFetcher:
+    """One shared comparison page request per collection cycle, not per site."""
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.attempted = False
+        self.prices = {}
+        self.error = None
+
+    def __call__(self, name):
+        direct_error = None
+        if name in DIRECT_SOURCES:
+            try:
+                price, currency = fetch_direct_price(name)
+                return PriceQuote(price, currency, DIRECT_SOURCES[name])
+            except Exception as exc:
+                direct_error = exc
+        if name in COMPARISON_MARKETS.values():
+            with self.lock:
+                if not self.attempted:
+                    self.attempted = True
+                    try:
+                        self.prices = parse_comparison(fetch_text(COMPARISON_URL, {'Accept':'text/html'}))
+                    except Exception as exc:
+                        self.error = exc
+            row = self.prices.get(name)
+            if row:
+                note = 'Цена из бесплатного сравнения CSGOSKINS.GG; время обновления на площадке неизвестно.'
+                if direct_error:
+                    note += ' Прямой источник: ' + error_message(direct_error)
+                return PriceQuote(**row, note=note)
+        if direct_error:
+            raise direct_error
+        if self.error:
+            raise self.error
+        raise ValueError(name + ': публичный источник не содержит предложений Danger Zone Case')
+
+
+def fetch_price(name):
+    return CycleFetcher()(name)
+
+
 def collect_source(name, fetcher=fetch_price, clock=time.time):
     stamp = clock()
     with app.connect() as c:
@@ -161,16 +226,23 @@ def collect_source(name, fetcher=fetch_price, clock=time.time):
         c.execute('UPDATE collector_status SET last_attempt=?,next_attempt=?,state=? WHERE name=?',
                   (app.now(), stamp + INTERVAL, 'running', name))
     try:
-        price, currency = fetcher(name)
+        result = fetcher(name)
+        if isinstance(result, PriceQuote):
+            price, currency, source, kind, note = result.price, result.currency, result.source, result.kind, result.note
+        else:
+            price, currency = result
+            source, kind, note = SOURCES[name], 'listing', ''
         price = positive_price(price)
-        if currency not in ('RUB', 'USD'):
+        if kind not in ('listing', 'instant', 'estimate'):
+            raise ValueError('Неизвестный тип автоматической цены')
+        if currency not in ('RUB', 'USD', 'EUR'):
             raise ValueError('Неизвестная валюта')
         with app.connect() as c:
             market_id = c.execute('SELECT id FROM markets WHERE name=?', (name,)).fetchone()[0]
-            c.execute('INSERT INTO collected_prices(market_id,price,currency,observed_at,source) VALUES(?,?,?,?,?)',
-                      (market_id, app.money(price), currency, app.now(), SOURCES[name]))
+            c.execute('INSERT INTO collected_prices(market_id,price,currency,observed_at,source,kind) VALUES(?,?,?,?,?,?)',
+                      (market_id, app.money(price), currency, app.now(), source, kind))
             c.execute('UPDATE collector_status SET state=?,error=?,failures=0,last_success=?,next_attempt=? WHERE name=?',
-                      ('ok','',app.now(),clock() + INTERVAL,name))
+                      ('ok',note,app.now(),clock() + INTERVAL,name))
     except Exception as exc:
         failures = old['failures'] + 1
         state = 'needs_key' if isinstance(exc, urllib.error.HTTPError) and exc.code == 401 else 'error'
@@ -194,8 +266,9 @@ class Collector:
         self.thread.start()
 
     def run_once(self):
+        fetcher = CycleFetcher()
         with ThreadPoolExecutor(max_workers=3) as pool:
-            list(pool.map(collect_source, SOURCES))
+            list(pool.map(lambda name: collect_source(name, fetcher), SOURCES))
 
     def run(self):
         while not self.stop_event.is_set():

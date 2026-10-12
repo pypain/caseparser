@@ -4,15 +4,17 @@ import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from sources import REGISTRY
-from collect import SOURCES, fetch_price, error_message, SameHostRedirect
+from collect import SOURCES, CycleFetcher, error_message, SameHostRedirect
 
+
+FETCHER = CycleFetcher()
 
 def check(pair):
     name,meta=pair
     if name in SOURCES:
         try:
-            price,currency=fetch_price(name)
-            return {'market':name,'adapter':True,'status':'ok','price':price,'currency':currency}
+            quote=FETCHER(name)
+            return {'market':name,'adapter':True,'status':'ok','price':quote.price,'currency':quote.currency,'kind':quote.kind,'source':quote.source}
         except Exception as e:
             return {'market':name,'adapter':True,'status':'error','error':error_message(e)}
     try:

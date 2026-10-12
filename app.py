@@ -36,6 +36,14 @@ MARKETS = [
     ('ShadowPay', 'https://shadowpay.com/', 'Условия и доступность в РФ требуют проверки', 1),
     ('white.market', 'https://white.market/', 'Условия и доступность в РФ требуют проверки', 1),
     ('Tradeit', 'https://tradeit.gg/', 'Условия и доступность в РФ требуют проверки', 1),
+    ('CS.MONEY', 'https://csgoskins.gg/markets/csmoney', 'Условия и доступность в РФ требуют проверки', 1),
+    ('SkinSwap', 'https://csgoskins.gg/markets/skinswap', 'Условия и доступность в РФ требуют проверки', 1),
+    ('SkinLand', 'https://csgoskins.gg/markets/skinland', 'Условия и доступность в РФ требуют проверки', 1),
+    ('AvanMarket', 'https://csgoskins.gg/markets/avanmarket', 'Условия и доступность в РФ требуют проверки', 1),
+    ('SkinPlace', 'https://csgoskins.gg/markets/skinplace', 'Условия и доступность в РФ требуют проверки', 1),
+    ('Skins.com', 'https://csgoskins.gg/markets/skinscom', 'Условия и доступность в РФ требуют проверки', 1),
+    ('Mannco.Store', 'https://csgoskins.gg/markets/manncostore', 'Условия и доступность в РФ требуют проверки', 1),
+    ('SkinSell', 'https://csgoskins.gg/markets/skinsell', 'Условия и доступность в РФ требуют проверки', 1),
 ]
 
 
@@ -72,7 +80,7 @@ def init_db():
         CREATE TABLE IF NOT EXISTS collected_prices(
           id INTEGER PRIMARY KEY, market_id INTEGER REFERENCES markets(id),
           price INTEGER NOT NULL, currency TEXT NOT NULL,
-          observed_at TEXT NOT NULL, source TEXT NOT NULL);
+          observed_at TEXT NOT NULL, source TEXT NOT NULL, kind TEXT NOT NULL DEFAULT 'listing');
         CREATE INDEX IF NOT EXISTS collected_market ON collected_prices(market_id,id);
         CREATE TABLE IF NOT EXISTS collector_status(
           name TEXT PRIMARY KEY, state TEXT NOT NULL DEFAULT 'pending', error TEXT NOT NULL DEFAULT '',
@@ -82,10 +90,22 @@ def init_db():
           market_id INTEGER PRIMARY KEY REFERENCES markets(id), sale_fee TEXT NOT NULL,
           withdrawal_fee TEXT NOT NULL, fixed_fee INTEGER NOT NULL, method TEXT NOT NULL,
           verified INTEGER NOT NULL, rub_rate TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS payout_rate_currency(
+          market_id INTEGER PRIMARY KEY REFERENCES markets(id), currency TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS sessions(digest TEXT PRIMARY KEY,expires REAL NOT NULL);
         CREATE TABLE IF NOT EXISTS login_failures(created_at REAL NOT NULL);
         ''')
+        columns = {r['name'] for r in c.execute('PRAGMA table_info(collected_prices)')}
+        if 'kind' not in columns:
+            c.execute("ALTER TABLE collected_prices ADD COLUMN kind TEXT NOT NULL DEFAULT 'listing'")
+            # New fallback paths deserve an immediate attempt after this upgrade.
+            c.execute('UPDATE collector_status SET next_attempt=0')
         c.executemany('INSERT OR IGNORE INTO markets(name,url,note,cash) VALUES(?,?,?,?)', MARKETS)
+        # Earlier versions supported RUB and USD only. Keep those existing rates bound
+        # to their currency without changing the old payout_settings table layout.
+        c.execute('''INSERT OR IGNORE INTO payout_rate_currency(market_id,currency)
+            SELECT s.market_id, CASE WHEN m.name IN ('Market.CSGO','Steam Community Market')
+              THEN 'RUB' ELSE 'USD' END FROM payout_settings s JOIN markets m ON m.id=s.market_id''')
         for name,source in REGISTRY.items():
             c.execute('INSERT OR IGNORE INTO collector_status(name,state,error) VALUES(?,?,?)',
                       (name,'pending' if source['supported'] else 'not_connected',
@@ -186,18 +206,23 @@ def snapshot(count=1):
           ORDER BY q2.observed_at DESC,q2.id DESC LIMIT 1)''')]
         automatic = [dict(r) for r in c.execute('''SELECT p.*,m.name,m.cash,m.excluded FROM collected_prices p
           JOIN markets m ON m.id=p.market_id WHERE p.id=(SELECT MAX(p2.id) FROM collected_prices p2 WHERE p2.market_id=p.market_id)''')]
-        settings = {r['market_id']: dict(r) for r in c.execute('SELECT * FROM payout_settings')}
+        settings = {r['market_id']: dict(r) for r in c.execute('''SELECT s.*,r.currency AS rate_currency
+            FROM payout_settings s JOIN payout_rate_currency r ON r.market_id=s.market_id''')}
         for p in automatic:
+            p['source_label'] = 'CSGOSKINS.GG · публичное сравнение' if urlparse(p['source']).hostname == 'csgoskins.gg' else 'Прямой источник площадки'
             p['stale'] = (datetime.now(timezone.utc) - datetime.fromisoformat(p['observed_at'])).total_seconds() > 86400
             s = settings.get(p['market_id'])
+            p['rate_mismatch'] = bool(s and s['rate_currency'] != p['currency'])
+            if p['rate_mismatch']:
+                continue
             if s:
                 converted = int((Decimal(p['price']) * (Decimal(s['rub_rate']) if p['currency'] != 'RUB' else 1)).quantize(Decimal('1'), rounding=ROUND_HALF_UP))
-                quotes.append(p | s | {'price': converted, 'kind': 'listing', 'automatic': True})
+                quotes.append(p | s | {'price': converted, 'automatic': True})
         for q in quotes:
             q.update(estimate(q, count))
             age = (datetime.now(timezone.utc) - datetime.fromisoformat(q['observed_at'])).total_seconds()
             q['stale'] = age > 86400
-            q['eligible'] = bool(q['cash'] and not q['excluded'] and q['verified'] and not q['stale'])
+            q['eligible'] = bool(q['cash'] and not q['excluded'] and q['verified'] and not q['stale'] and q['kind'] != 'estimate')
         quotes.sort(key=lambda q: (not q['eligible'], -q['received']))
         batches = [batch_state(c, r[0]) for r in c.execute('SELECT id FROM batches ORDER BY id DESC')]
         sales = [dict(r) for r in c.execute('SELECT s.*,b.owner,m.name FROM sales s JOIN batches b ON b.id=s.batch_id JOIN markets m ON m.id=s.market_id ORDER BY s.id DESC')]
@@ -220,6 +245,11 @@ def mutate(path, d):
             market_id = int(d['market_id'])
             if not c.execute('SELECT id FROM markets WHERE id=?', (market_id,)).fetchone():
                 raise ValueError('Площадка не найдена')
+            latest = c.execute('SELECT currency FROM collected_prices WHERE market_id=? ORDER BY id DESC LIMIT 1',
+                               (market_id,)).fetchone()
+            currency = d.get('rate_currency') or (latest['currency'] if latest else None)
+            if currency not in ('RUB','USD','EUR'):
+                raise ValueError('Укажите валюту цены для этого курса: RUB, USD или EUR')
             try:
                 rate = Decimal(str(d['rub_rate']))
             except InvalidOperation as exc:
@@ -234,6 +264,8 @@ def mutate(path, d):
               method=excluded.method,verified=excluded.verified,rub_rate=excluded.rub_rate''',
               (market_id, percentage(d['sale_fee']), percentage(d['withdrawal_fee']), money(d['fixed_fee_rub']),
                method, flag(d['verified']), str(rate)))
+            c.execute('''INSERT INTO payout_rate_currency(market_id,currency) VALUES(?,?)
+                ON CONFLICT(market_id) DO UPDATE SET currency=excluded.currency''', (market_id,currency))
         elif path == '/api/quotes':
             add_quote(c, d)
         elif path == '/api/import':

@@ -35,17 +35,18 @@ async function load(){
 }
 function render(){
   const {markets,quotes,batches,sales,payments} = state;
-  $('#price-count').textContent=markets.length;
-  $('#coverage-summary').textContent=`Цены получены: ${state.automatic.length} из ${markets.length} · Автосбор подключен: ${state.collectors.filter(s=>s.supported).length} · Остальные требуют подключения`;
+  $('#price-count').textContent=new Set([...state.automatic,...quotes].map(q=>q.market_id)).size;
+  $('#market-count').textContent=markets.length;
+  $('#coverage-summary').textContent=`Цены получены: ${new Set(state.automatic.map(p=>p.market_id)).size} из ${markets.length} · Автосбор подключен: ${state.collectors.filter(s=>s.supported).length} · Остальные требуют подключения`;
   const statusText={pending:'Ожидание первого запроса',running:'Запрос выполняется',ok:'Цена получена',error:'Ошибка доступа или ответа',needs_key:'Требуется ключ API',not_connected:'Автосбор не подключен'};
   $('#stock-count').textContent=batches.reduce((a,b)=>a+b.remaining,0);
-  $('#auto-prices').innerHTML = state.automatic.map(p=>`<tr><td>${esc(p.name)}${p.stale?'<small>Цена устарела</small>':''}</td><td>${cash(p.price,p.currency)}</td><td>${date(p.observed_at)}</td><td>${esc(p.source)}</td></tr>`).join('') || '<tr><td colspan="4">Сбор еще не получил цены. Проверь статус источников.</td></tr>';
+  $('#auto-prices').innerHTML = state.automatic.map(p=>`<tr><td>${esc(p.name)}<small>${p.kind==='estimate'?'Оценка продажи':p.kind==='instant'?'Заявка на выкуп':'Цена выставления'}</small>${p.stale?'<small>Цена устарела</small>':''}</td><td>${cash(p.price,p.currency)}</td><td>${date(p.observed_at)}</td><td>${esc(p.source_label)}<small>${esc(p.source)}</small></td></tr>`).join('') || '<tr><td colspan="4">Сбор еще не получил цены. Проверь статус источников.</td></tr>';
   $('#collector-status').innerHTML = state.collectors.map(s=>`<div class="card"><strong>${esc(s.name)}</strong><p>${statusText[s.state]||s.state}</p><p>${esc(s.error)}</p><p>Последний успех: ${s.last_success?date(s.last_success):'не было'}<br>Следующая попытка: ${s.next_attempt?date(new Date(s.next_attempt*1000).toISOString()):(s.supported?'при запуске':'не запланирована')}</p></div>`).join('');
   document.querySelectorAll('.auto-market-options').forEach(s=>options(s,markets.filter(m=>state.collectors.some(s=>s.name===m.name&&s.supported)).map(m=>option(m.id,m.name)).join('')));
-  $('#saved-settings').innerHTML = state.payout_settings.map(s=>`<p>${esc(markets.find(m=>m.id===s.market_id).name)} · ${esc(s.method)} · продажа ${esc(s.sale_fee)}% · вывод ${esc(s.withdrawal_fee)}% + ${rub(s.fixed_fee)} · курс ${esc(s.rub_rate)} · ${s.verified?'Подтверждено вручную':'Не подтверждено'}</p>`).join('');
-  const kinds = {instant:'Мгновенная продажа', listing:'Цена выставления'};
-  const displayed=[...quotes,...state.automatic.filter(p=>!quotes.some(q=>q.automatic&&q.market_id===p.market_id)).map(p=>({...p,kind:'listing',unknownFees:true}))];
-  $('#quotes').innerHTML = displayed.length ? displayed.map(q => `<tr><td>${esc(q.name)}<small>${kinds[q.kind]}</small></td><td>${q.unknownFees?cash(q.price,q.currency):rub(q.price)}<small>${q.unknownFees?'Условия вывода не заданы':`Продажа ${esc(q.sale_fee)}%; вывод ${esc(q.withdrawal_fee)}% + ${rub(q.fixed_fee)}`}</small></td><td>${q.unknownFees?'Настрой в разделе «Автосбор»':esc(q.method)}</td><td>${q.unknownFees?'—':rub(q.received)}</td><td>${q.unknownFees?'—':rub(q.own_share)}</td><td>${q.unknownFees?'—':rub(q.owner_share)}</td><td>${date(q.observed_at)}<small>${esc(q.source)}</small></td><td>${!q.cash?'Баланс Steam':q.excluded?'Исключена':q.unknownFees?'Нужны комиссии':!q.verified?'Вывод не проверен':q.stale?'Цена устарела':'Проверено вручную'}</td></tr>`).join('') : '';
+  $('#saved-settings').innerHTML = state.payout_settings.map(s=>`<p>${esc(markets.find(m=>m.id===s.market_id).name)} · ${esc(s.method)} · продажа ${esc(s.sale_fee)}% · вывод ${esc(s.withdrawal_fee)}% + ${rub(s.fixed_fee)} · курс ${esc(s.rub_rate)} ₽/${esc(s.rate_currency)} · ${s.verified?'Подтверждено вручную':'Не подтверждено'}</p>`).join('');
+  const kinds = {instant:'Заявка на выкуп', listing:'Цена выставления', estimate:'Оценка продажи'};
+  const displayed=[...quotes,...state.automatic.filter(p=>!quotes.some(q=>q.automatic&&q.market_id===p.market_id)).map(p=>({...p,unknownFees:true}))];
+  $('#quotes').innerHTML = displayed.length ? displayed.map(q => `<tr><td>${esc(q.name)}<small>${kinds[q.kind]}</small></td><td>${q.unknownFees?cash(q.price,q.currency):rub(q.price)}<small>${q.unknownFees?(q.rate_mismatch?'Измени курс для '+esc(q.currency):'Условия вывода не заданы'):`Продажа ${esc(q.sale_fee)}%; вывод ${esc(q.withdrawal_fee)}% + ${rub(q.fixed_fee)}`}</small></td><td>${q.unknownFees?'Настрой в разделе «Автосбор»':esc(q.method)}</td><td>${q.unknownFees?'—':rub(q.received)}</td><td>${q.unknownFees?'—':rub(q.own_share)}</td><td>${q.unknownFees?'—':rub(q.owner_share)}</td><td>${date(q.observed_at)}<small>${esc(q.source_label||'')}</small><small>${esc(q.source)}</small></td><td>${!q.cash?'Баланс Steam':q.excluded?'Исключена':q.stale?'Цена устарела':q.unknownFees?(q.rate_mismatch?'Другая валюта курса':'Нужны комиссии'):!q.verified?'Вывод не проверен':'Проверено вручную'}</td></tr>`).join('') : '';
   $('#quotes').innerHTML += markets.filter(m=>!displayed.some(q=>q.market_id===m.id)).map(m=>{const s=state.collectors.find(s=>s.name===m.name);return `<tr class="no-price"><td><a href="${esc(m.url)}" target="_blank" rel="noopener noreferrer">${esc(m.name)}</a></td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>${s&&s.last_attempt?date(s.last_attempt):'Цена еще не получена'}<small>${esc(s?.error||'')}</small></td><td>${m.excluded?'Исключена':statusText[s?.state]||'Нет данных'}</td></tr>`;}).join('');
   const instant = quotes.find(q => q.eligible && q.kind === 'instant');
   const listing = quotes.find(q => q.eligible && q.kind === 'listing');
@@ -67,10 +68,10 @@ function render(){
 }
 function chart(){
   const currency=$('#history-currency').value;
-  const rows = [...state.history.map(q=>({...q,currency:'RUB'})), ...state.auto_history.map(q=>({...q,kind:'listing',method:'Автосбор'}))].filter(q=>q.market_id===Number($('#history-market').value)&&q.currency===currency).sort((a,b)=>Date.parse(a.observed_at)-Date.parse(b.observed_at));
+  const rows = [...state.history.map(q=>({...q,currency:'RUB'})), ...state.auto_history.map(q=>({...q,method:'Автосбор'}))].filter(q=>q.market_id===Number($('#history-market').value)&&q.currency===currency).sort((a,b)=>Date.parse(a.observed_at)-Date.parse(b.observed_at));
   const canvas = $('#chart'), ctx = canvas.getContext('2d'), w=canvas.width,h=canvas.height;
   ctx.clearRect(0,0,w,h);ctx.font='14px sans-serif';ctx.fillStyle='#a2b0c7';
-  $('#history-table').innerHTML = '<table><thead><tr><th>Время</th><th>Цена</th><th>Тип / вывод</th><th>Источник</th></tr></thead><tbody>' + rows.map(q=>`<tr><td>${date(q.observed_at)}</td><td>${cash(q.price,currency)}</td><td>${q.kind==='instant'?'Мгновенная':'Выставление'} / ${esc(q.method)}</td><td>${esc(q.source)}</td></tr>`).join('')+'</tbody></table>';
+  $('#history-table').innerHTML = '<table><thead><tr><th>Время</th><th>Цена</th><th>Тип / вывод</th><th>Источник</th></tr></thead><tbody>' + rows.map(q=>`<tr><td>${date(q.observed_at)}</td><td>${cash(q.price,currency)}</td><td>${q.kind==='estimate'?'Оценка продажи':q.kind==='instant'?'Мгновенная':'Выставление'} / ${esc(q.method)}</td><td>${esc(q.source)}</td></tr>`).join('')+'</tbody></table>';
   if(!rows.length){ctx.fillText('История пока пуста',30,55);return;}
   const times=rows.map(q=>Date.parse(q.observed_at)),prices=rows.map(q=>q.price),tmin=Math.min(...times),tmax=Math.max(...times),pmin=Math.min(...prices),pmax=Math.max(...prices);
   const x=t=>80+(t-tmin)/(tmax-tmin||1)*(w-110),y=p=>h-65-(p-pmin)/(pmax-pmin||1)*(h-115);
@@ -83,6 +84,10 @@ document.querySelectorAll('form[data-api]').forEach(form=>form.addEventListener(
   e.preventDefault();$('#error').textContent='';const button=form.querySelector('button');button.disabled=true;
   try{let data=Object.fromEntries(new FormData(form));if(form.dataset.api==='import')data={csv:await $('#csvfile').files[0].text()};await api(form.dataset.api,data);form.reset();await load();}catch(e){report(e);}finally{button.disabled=false;}
 }));
+document.querySelector('.auto-market-options').addEventListener('change',e=>{
+  const price=state.automatic.find(p=>p.market_id===Number(e.target.value));
+  if(price)e.target.form.elements.rate_currency.value=price.currency;
+});
 $('#market-list').addEventListener('click',async e=>{const b=e.target.closest('[data-market]');if(!b)return;b.disabled=true;try{await api('markets',{id:b.dataset.market,excluded:b.dataset.excluded});await load();}catch(e){report(e);b.disabled=false;}});
 $('#count').addEventListener('change',()=>load().catch(report));$('#history-market').addEventListener('change',chart);load().catch(report);
 $('#history-currency').addEventListener('change',chart);
